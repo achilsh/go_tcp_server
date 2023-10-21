@@ -10,6 +10,7 @@ import (
 type IBusiLogic interface {
 	LogicProc(in []byte) []byte
 	GetResponseCmd() uint16
+	GetReqCmd() uint16
 }
 
 type LoginLogic struct {
@@ -21,6 +22,9 @@ func NewLoginHandle() IBusiLogic {
 	return &LoginLogic{}
 }
 
+func (l *LoginLogic) GetReqCmd() uint16 {
+	return util.LOGIN_CMD
+}
 func (l *LoginLogic) GetResponseCmd() uint16 {
 	return util.LOGIN_CMD_RSP
 }

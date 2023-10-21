@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -13,7 +12,10 @@ import (
 	"net"
 	"net_tcp_server_demo/opts"
 	"net_tcp_server_demo/util"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -59,31 +61,32 @@ func (s *ServerNode) AddConnection(svrAddr string, newConn *ServerConn) error {
 	return nil
 }
 func (s *ServerNode) Stop() {
-	s.quit.Fire()
-
-	defer func() {
-		s.serveWG.Wait()
-		s.done.Fire()
-	}()
-
-	s.mu.Lock()
-	toCloseListener := s.l
-	s.l = nil
-	conns := s.conns
-	s.conns = nil
-
-	s.cv.Broadcast()
-	s.mu.Unlock()
-
-	toCloseListener.Close()
-	for _, cs := range conns {
-		for item := range cs {
-			item.UnderlyingConn.Close()
-		}
-	}
+	//s.quit.Fire()
+	//
+	//defer func() {
+	//	s.serveWG.Wait()
+	//	s.done.Fire()
+	//}()
+	//
+	//s.mu.Lock()
+	//toCloseListener := s.l
+	//s.l = nil
+	//conns := s.conns
+	//s.conns = nil
+	//
+	//s.cv.Broadcast()
+	//s.mu.Unlock()
+	//
+	//toCloseListener.Close()
+	//for _, cs := range conns {
+	//	for item := range cs {
+	//		item.UnderlyingConn.Close()
+	//	}
+	//}
 }
 
 func (s *ServerNode) GracefulStop() {
+	log.Println("grace stop......")
 	s.quit.Fire()
 	defer s.done.Fire()
 
@@ -100,6 +103,7 @@ func (s *ServerNode) GracefulStop() {
 
 	s.mu.Lock()
 	for len(s.conns) != 0 {
+		log.Printf("wait conn to close, not close conn nums: %v\n", len(s.conns))
 		s.cv.Wait()
 	}
 	s.conns = nil
@@ -126,11 +130,26 @@ func (s *ServerNode) ServerWait() error {
 
 	s.serveWG.Add(1)
 	defer func() {
+		log.Println("entry to end.")
 		s.serveWG.Done()
 
 		if s.quit.HasFired() {
+			log.Println("entry has fired.")
+
+			for _, tmpC := range s.conns {
+				for kc, kv := range tmpC {
+					if kv == false {
+						continue
+					}
+					if kc == nil {
+						continue
+					}
+					kc.UnderlyingConn.SetDeadline(time.Now().Add(time.Millisecond * 2))
+				}
+			}
 			<-s.done.Done()
 		}
+		log.Println("at end of wait.")
 	}()
 
 	s.lis[s.l] = true
@@ -171,10 +190,11 @@ func (s *ServerNode) ServerWait() error {
 			}
 
 			s.mu.Lock()
-			log.Printf("do serving; accept = %v\n", e)
+			log.Printf("do serving; accept happen err: %v\n", e)
 			s.mu.Unlock()
 
 			if s.quit.HasFired() {
+				log.Printf("has fired on quit.")
 				return nil
 			}
 			return e
@@ -210,6 +230,7 @@ func (s *ServerNode) RecvMsg(sc *ServerConn) error {
 		}
 
 		retN, e := io.ReadFull(sc.UnderlyingConn, sc.Header.headBuf[sc.Header.hasHeadReadLen:util.HEAD_LEN_MAX])
+
 		if e != nil && e == io.ErrUnexpectedEOF {
 			sc.Header.hasHeadReadLen += int32(retN)
 			continue
@@ -293,6 +314,9 @@ func (s *ServerNode) GetLogicHandle(cmd uint16) IBusiLogic {
 	}
 	return ret
 }
+func (s *ServerNode) RegisterLogicHandle(busi IBusiLogic) {
+	s.LogicHandles[busi.GetReqCmd()] = busi
+}
 
 func (s *ServerNode) DoBusiness(sc *ServerConn) error {
 	e := s.RecvMsg(sc)
@@ -305,12 +329,12 @@ func (s *ServerNode) DoBusiness(sc *ServerConn) error {
 		return fmt.Errorf("not get logic handle")
 	}
 
-	data := logicHandle.LogicProc(sc.PayLoad.payLoadBuf)
+	data := logicHandle.LogicProc(sc.PayLoad.payLoadBuf) // different logic need to implement and register to ServerNode.
 	if data == nil {
 		return fmt.Errorf("proc logic ret is nil")
 	}
-	cmdTypeRsp := logicHandle.GetResponseCmd()
-	return s.SendMsg(sc, data, cmdTypeRsp)
+
+	return s.SendMsg(sc, data, logicHandle.GetResponseCmd())
 }
 func (s *ServerNode) SendMsg(sc *ServerConn, data []byte, rspType uint16) error {
 	log.Printf("buf data len: %d\n, value: %s\n", len(data), string(data))
@@ -342,7 +366,6 @@ func (s *ServerNode) RemoveConn(svrAddr string, conn *ServerConn) {
 		delete(s.conns, svrAddr)
 	}
 	conn.UnderlyingConn.Close()
-
 	s.cv.Broadcast()
 }
 
@@ -408,7 +431,9 @@ func NewTcpServer(optParams ...opts.IServerOption) *ServerNode {
 		LogicHandles: make(map[uint16]IBusiLogic),
 	}
 	ret.cv = sync.NewCond(&ret.mu)
-	ret.LogicHandles[util.LOGIN_CMD] = NewLoginHandle()
+
+	// different logic need to register to servernode like this.
+	ret.RegisterLogicHandle(NewLoginHandle())
 	return ret
 }
 
@@ -489,19 +514,20 @@ func NewPackageHead(c net.Conn, wbufSz, rbufSz int, sharedWBuf bool) *PackageHea
 }
 
 func main() {
-	ctx := context.Background()
-
 	s := NewTcpServer()
 	if e := s.Listen(); e != nil {
 		return
 	}
 
 	go func() {
-		defer s.GracefulStop()
-		<-ctx.Done()
+		if e := s.ServerWait(); e != nil {
+			return
+		}
 	}()
 
-	if e := s.ServerWait(); e != nil {
-		return
-	}
+	chSig := make(chan os.Signal)
+	signal.Notify(chSig, syscall.SIGINT, syscall.SIGTERM)
+	fmt.Println("Signal: ", <-chSig)
+	s.GracefulStop()
+	//s.Stop()
 }
