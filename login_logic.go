@@ -48,7 +48,7 @@ func (l *LoginLogic) LogicProc(in []byte) []byte {
 			break
 		}
 
-		log.Printf("req, Name: %s, Age: %d, score: %f", l.Req.Name, l.Req.Age, l.Req.Score)
+		//log.Printf("req, Name: %s, Age: %d, score: %f", l.Req.Name, l.Req.Age, l.Req.Score)
 
 		l.Rsp.Code = 1000
 		l.Rsp.Message = "succc"

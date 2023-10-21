@@ -442,8 +442,6 @@ type ServerConn struct {
 	bufferPool     *util.BufferPool
 	Header         *PackageHead
 	PayLoad        *PackagePayLoad
-	//
-
 }
 
 type PackagePayLoad struct {
