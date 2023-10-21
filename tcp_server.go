@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
+	"net_tcp_server_demo/opts"
 	"net_tcp_server_demo/util"
 	"sync"
 	"time"
@@ -24,12 +28,83 @@ type ServerConfig struct {
 }
 
 type ServerNode struct {
+	opts   opts.ServerOptions
 	config ServerConfig
-	//
+
+	mu           sync.Mutex // guards following
+	lis          map[net.Listener]bool
 	l            net.Listener
+	conns        map[string]map[*ServerConn]bool
 	LogicHandles map[uint16]IBusiLogic
+	//
+	quit *util.Event
+	done *util.Event
+
+	serveWG sync.WaitGroup
+	cv      *sync.Cond
 }
 
+func (s *ServerNode) AddConnection(svrAddr string, newConn *ServerConn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	//
+	if s.conns == nil {
+		newConn.UnderlyingConn.Close()
+		return errors.New("addConn called when server has already been stopped")
+	}
+	if s.conns[svrAddr] == nil {
+		s.conns[svrAddr] = make(map[*ServerConn]bool)
+	}
+	s.conns[svrAddr][newConn] = true
+	return nil
+}
+func (s *ServerNode) Stop() {
+	s.quit.Fire()
+
+	defer func() {
+		s.serveWG.Wait()
+		s.done.Fire()
+	}()
+
+	s.mu.Lock()
+	toCloseListener := s.l
+	s.l = nil
+	conns := s.conns
+	s.conns = nil
+
+	s.cv.Broadcast()
+	s.mu.Unlock()
+
+	toCloseListener.Close()
+	for _, cs := range conns {
+		for item := range cs {
+			item.UnderlyingConn.Close()
+		}
+	}
+}
+
+func (s *ServerNode) GracefulStop() {
+	s.quit.Fire()
+	defer s.done.Fire()
+
+	s.mu.Lock()
+	if s.conns == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.l.Close()
+	s.l = nil
+	s.mu.Unlock()
+
+	s.serveWG.Wait()
+
+	s.mu.Lock()
+	for len(s.conns) != 0 {
+		s.cv.Wait()
+	}
+	s.conns = nil
+	s.mu.Unlock()
+}
 func (s *ServerNode) Listen() error {
 	r, e := net.Listen(s.config.NetWork, fmt.Sprintf("%v:%d", s.config.Ip, s.config.Port))
 	if e != nil {
@@ -41,9 +116,36 @@ func (s *ServerNode) Listen() error {
 
 }
 func (s *ServerNode) ServerWait() error {
-	for {
-		var tempDelay time.Duration = 0
+	s.mu.Lock()
+	fmt.Println("serving....")
+	if s.lis == nil {
+		s.mu.Unlock()
+		s.l.Close()
+		return errors.New("tcp: the server has been stopped")
+	}
 
+	s.serveWG.Add(1)
+	defer func() {
+		s.serveWG.Done()
+
+		if s.quit.HasFired() {
+			<-s.done.Done()
+		}
+	}()
+
+	s.lis[s.l] = true
+	defer func() {
+		s.mu.Lock()
+		if s.lis != nil && s.lis[s.l] {
+			s.l.Close()
+			delete(s.lis, s.l)
+		}
+		s.mu.Unlock()
+	}()
+	s.mu.Unlock()
+
+	var tempDelay time.Duration = 0
+	for {
 		rawConn, e := s.l.Accept()
 		if e != nil {
 			if ne, ok := e.(interface{ Temporary() bool }); ok && ne.Temporary() {
@@ -61,18 +163,28 @@ func (s *ServerNode) ServerWait() error {
 				tmr := time.NewTimer(tempDelay)
 				select {
 				case <-tmr.C:
-					//
-					// other finish notify.
+				case <-s.quit.Done():
+					tmr.Stop()
+					return nil
 				}
 				continue
 			}
+
+			s.mu.Lock()
+			log.Printf("do serving; accept = %v\n", e)
+			s.mu.Unlock()
+
+			if s.quit.HasFired() {
+				return nil
+			}
 			return e
 		}
-		tempDelay = 0
 
+		tempDelay = 0
+		s.serveWG.Add(1)
 		go func() {
-			// do new connection logic.
 			s.ReadWriteOnConn(s.l.Addr().String(), rawConn)
+			s.serveWG.Done()
 		}()
 	}
 	return nil
@@ -102,14 +214,18 @@ func (s *ServerNode) RecvMsg(sc *ServerConn) error {
 			sc.Header.hasHeadReadLen += int32(retN)
 			continue
 		}
+		if e != nil && e == io.EOF {
+			log.Printf("peer close connect.")
+			return e
+		}
 		if e != nil {
 			log.Printf("read head from network fail, err: %v\n", e)
 			return e
 		}
 		sc.Header.hasHeadReadLen += int32(retN)
 	}
-	sc.Header.hasHeadReadLen = 0
-	//
+	sc.Header.ResetHeadRecvLen()
+
 	pkgLen := binary.BigEndian.Uint32(sc.Header.headBuf[:])
 	if pkgLen > util.PKG_LEN_MAX {
 		log.Printf("get pkg len: %v more than: %v\n", pkgLen, util.PKG_LEN_MAX)
@@ -137,10 +253,9 @@ func (s *ServerNode) RecvMsg(sc *ServerConn) error {
 		}
 		sc.Header.hasCmdReadLen += int32(retN)
 	}
-	sc.Header.hasCmdReadLen = 0
 	cmdType := binary.BigEndian.Uint16(sc.Header.cmdBuf[:])
 	sc.Header.cmdValue = cmdType
-	//
+	sc.Header.ResetHeadCmdLen()
 
 	needRecvPayLoadLen := sc.Header.pkgLen - uint32(util.HEAD_LEN_MAX+util.CMD_TYPE_LEN)
 	if needRecvPayLoadLen <= 0 {
@@ -166,7 +281,8 @@ func (s *ServerNode) RecvMsg(sc *ServerConn) error {
 		}
 		sc.PayLoad.receivedPkgLen += int32(retN)
 	}
-	sc.PayLoad.receivedPkgLen = 0
+	sc.PayLoad.ResetRecvPayLoadLen()
+
 	return nil
 }
 
@@ -212,26 +328,78 @@ func (s *ServerNode) SendMsg(sc *ServerConn, data []byte, rspType uint16) error 
 	log.Printf("send data len: %d\n", len(sendBuf))
 	return nil
 }
+func (s *ServerNode) RemoveConn(svrAddr string, conn *ServerConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	conns := s.conns[svrAddr]
+	if conns == nil {
+		return
+	}
+
+	delete(conns, conn)
+	if len(conns) == 0 {
+		delete(s.conns, svrAddr)
+	}
+	conn.UnderlyingConn.Close()
+
+	s.cv.Broadcast()
+}
 
 func (s *ServerNode) ReadWriteOnConn(svrAddr string, newConn net.Conn) error {
-	newConn.SetDeadline(time.Now().Add(10000 * time.Second)) //TEST....
-	//
+	if s.quit.HasFired() {
+		newConn.Close()
+		return nil
+	}
+	newConn.SetDeadline(time.Now().Add(s.opts.ConnectionTimeout)) //TEST....
 	sc := s.NewServerConnected(newConn)
-	go func() {
+	if sc == nil {
+		return nil
+	}
+	if e := s.AddConnection(svrAddr, sc); e != nil {
+		return nil
+	}
+
+	func() {
 		for {
 			e := s.DoBusiness(sc)
 			if e != nil {
 				break
 			}
 		}
+		s.RemoveConn(svrAddr, sc)
 	}()
 	return nil
 }
 
-func NewServer() *ServerNode {
-	flag.Parse()
+const (
+	defaultServerMaxReceiveMessageSize = 1024 * 1024 * 4
+	defaultServerMaxSendMessageSize    = math.MaxInt32
+	defaultWriteBufSize                = 32 * 1024
+	defaultReadBufSize                 = 32 * 1024
+)
 
+var defaultServerOptions = opts.ServerOptions{
+	MaxReceiveMessageSize: defaultServerMaxReceiveMessageSize,
+	MaxSendMessageSize:    defaultServerMaxSendMessageSize,
+	ConnectionTimeout:     120000 * time.Second, //120
+	WriteBufferSize:       defaultWriteBufSize,
+	ReadBufferSize:        defaultReadBufSize,
+	RecvBufferPool:        util.NewSharedBufferPool(),
+}
+
+func NewTcpServer(optParams ...opts.IServerOption) *ServerNode {
+	flag.Parse()
+	optsPtr := &defaultServerOptions
+	for _, o := range optParams {
+		o.Apply(optsPtr)
+	}
 	ret := &ServerNode{
+		lis:   make(map[net.Listener]bool),
+		opts:  *optsPtr,
+		quit:  util.NewEvent(),
+		done:  util.NewEvent(),
+		conns: make(map[string]map[*ServerConn]bool),
 		config: ServerConfig{
 			Port:    *port,
 			Ip:      "",
@@ -239,15 +407,12 @@ func NewServer() *ServerNode {
 		},
 		LogicHandles: make(map[uint16]IBusiLogic),
 	}
-	//
+	ret.cv = sync.NewCond(&ret.mu)
 	ret.LogicHandles[util.LOGIN_CMD] = NewLoginHandle()
 	return ret
 }
 
 type ServerConn struct {
-	// read buf, write buf
-	// read index, write index.
-	// underlying connect
 	UnderlyingConn net.Conn
 	bufferPool     *util.BufferPool
 	Header         *PackageHead
@@ -262,6 +427,10 @@ type PackagePayLoad struct {
 	receivedPkgLen int32
 }
 
+func (p *PackagePayLoad) ResetRecvPayLoadLen() {
+	p.receivedPkgLen = 0
+}
+
 func NewPkgPayLoad(c net.Conn) *PackagePayLoad {
 	return &PackagePayLoad{
 		r:              c,
@@ -270,8 +439,8 @@ func NewPkgPayLoad(c net.Conn) *PackagePayLoad {
 }
 
 type PackageHead struct {
-	writer     *util.BufWriter
-	r          io.Reader
+	//writer     *util.BufWriter
+	//r          io.Reader
 	getReadBuf func(size uint32) []byte
 	//readBuf     []byte // cache for default getReadBuf
 	headBuf        [util.HEAD_LEN_MAX]byte
@@ -284,22 +453,29 @@ type PackageHead struct {
 	cmdValue      uint16 // parsed value
 }
 
+func (h *PackageHead) ResetHeadCmdLen() {
+	h.hasCmdReadLen = 0
+}
+func (h *PackageHead) ResetHeadRecvLen() {
+	h.hasHeadReadLen = 0
+}
+
 func NewPackageHead(c net.Conn, wbufSz, rbufSz int, sharedWBuf bool) *PackageHead {
 	var r io.Reader = c
 	if rbufSz > 0 {
 		r = bufio.NewReaderSize(r, rbufSz)
 	}
 
-	var pool *sync.Pool
-	if sharedWBuf {
-		pool = util.GetWriteBufferPool(wbufSz)
-	}
+	//var pool *sync.Pool
+	//if sharedWBuf {
+	//	pool = util.GetWriteBufferPool(wbufSz)
+	//}
 
-	w := util.NewBufWriter(c, wbufSz, pool)
+	//w := util.NewBufWriter(c, wbufSz, pool)
 
 	h := &PackageHead{
-		writer: w,
-		r:      r,
+		//writer: w,
+		//r:      r,
 	}
 
 	//h.getReadBuf = func(size uint32) []byte {
@@ -311,11 +487,19 @@ func NewPackageHead(c net.Conn, wbufSz, rbufSz int, sharedWBuf bool) *PackageHea
 	//}
 	return h
 }
+
 func main() {
-	s := NewServer()
+	ctx := context.Background()
+
+	s := NewTcpServer()
 	if e := s.Listen(); e != nil {
 		return
 	}
+
+	go func() {
+		defer s.GracefulStop()
+		<-ctx.Done()
+	}()
 
 	if e := s.ServerWait(); e != nil {
 		return

@@ -26,7 +26,7 @@ func (l *LoginLogic) GetResponseCmd() uint16 {
 }
 func (l *LoginLogic) LogicProc(in []byte) []byte {
 	l.Rsp = new(proto.LoginRsp)
-	codeHandle := util.GetCodecs(util.CODES_JSON)
+	codeHandle := util.GetCodecs(util.CODEC_JSON)
 
 	for {
 		if len(in) <= 0 {

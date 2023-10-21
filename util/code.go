@@ -1,31 +1,28 @@
 package util
 
-import "encoding/json"
+var registeredCodecs = make(map[int]ICodecs)
 
 const (
-	CODES_JSON = 1
+	CODEC_JSON = 1
 )
 
 type ICodecs interface {
 	Decode(inPayLoad []byte, outBusi any) error
 	Encode(inPayLoad any) ([]byte, error)
+	GetType() int
 }
-type JsonParser struct {
+
+func RegisterCodec(codec ICodecs) {
+	if codec == nil {
+		return
+	}
+	registeredCodecs[codec.GetType()] = codec
 }
 
 func GetCodecs(t int) ICodecs {
-	switch t {
-	case CODES_JSON:
-		return &JsonParser{}
+	codec, ok := registeredCodecs[t]
+	if !ok {
+		return nil
 	}
-	return nil
-}
-
-func (j *JsonParser) Decode(inPayLoad []byte, outBusi any) error {
-	e := json.Unmarshal(inPayLoad, outBusi)
-	return e
-}
-func (j *JsonParser) Encode(inPayLoad any) ([]byte, error) {
-	ret, e := json.Marshal(inPayLoad)
-	return ret, e
+	return codec
 }
