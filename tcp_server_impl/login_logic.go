@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net_tcp_server_demo/proto"
@@ -11,6 +12,9 @@ type IBusiLogic interface {
 	LogicProc(in []byte) []byte
 	GetResponseCmd() uint16
 	GetReqCmd() uint16
+	//
+	checkReqParams([]byte) error
+	doInnerLogic() error
 }
 
 type LoginLogic struct {
@@ -19,7 +23,15 @@ type LoginLogic struct {
 }
 
 func NewLoginHandle() IBusiLogic {
-	return &LoginLogic{}
+	ret := &LoginLogic{
+		Req: new(proto.LoginReq),
+		Rsp: new(proto.LoginRsp),
+	}
+
+	ret.Rsp.Code = 1000
+	ret.Rsp.Message = "succc"
+	ret.Rsp.Data = "ok"
+	return ret
 }
 
 func (l *LoginLogic) GetReqCmd() uint16 {
@@ -28,19 +40,27 @@ func (l *LoginLogic) GetReqCmd() uint16 {
 func (l *LoginLogic) GetResponseCmd() uint16 {
 	return util.LOGIN_CMD_RSP
 }
-func (l *LoginLogic) LogicProc(in []byte) []byte {
-	l.Rsp = new(proto.LoginRsp)
-	codeHandle := util.GetCodecs(util.CODEC_JSON)
+func (l *LoginLogic) checkReqParams(data []byte) error {
+	if len(data) <= 0 {
+		l.Rsp.Code = 2000
+		l.Rsp.Message = "input data is empty"
+		return errors.New("input param is invalid")
+	}
+	return nil
+}
+func (l *LoginLogic) doInnerLogic() error {
+	//TODO:
+	return nil
+}
 
+func (l *LoginLogic) LogicProc(in []byte) []byte {
+	codeHandle := util.GetCodecs(util.CODEC_JSON)
 	for {
-		if len(in) <= 0 {
-			l.Rsp.Code = 2000
-			l.Rsp.Message = "input data is empty"
+		if l.checkReqParams(in) != nil { //check input parameters.
 			break
 		}
 
-		l.Req = new(proto.LoginReq)
-		e := codeHandle.Decode(in, l.Req)
+		e := codeHandle.Decode(in, l.Req) // decode request message.
 		if e != nil {
 			l.Rsp.Code = 2001
 			l.Rsp.Message = fmt.Sprintf("decode fail, e: %v", e)
@@ -48,11 +68,7 @@ func (l *LoginLogic) LogicProc(in []byte) []byte {
 			break
 		}
 
-		//log.Printf("req, Name: %s, Age: %d, score: %f", l.Req.Name, l.Req.Age, l.Req.Score)
-
-		l.Rsp.Code = 1000
-		l.Rsp.Message = "succc"
-		l.Rsp.Data = "ok"
+		l.doInnerLogic() // do business logic.
 
 		break
 	}
