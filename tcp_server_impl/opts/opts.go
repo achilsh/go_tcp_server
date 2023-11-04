@@ -12,6 +12,7 @@ type ServerOptions struct {
 	WriteBufferSize       int
 	ReadBufferSize        int
 	RecvBufferPool        util.SharedBufferPool
+	StopWaitMillSecond    int32
 }
 
 type IServerOption interface {

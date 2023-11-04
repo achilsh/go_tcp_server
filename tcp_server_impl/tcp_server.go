@@ -24,9 +24,10 @@ var (
 )
 
 type ServerConfig struct {
-	Port    int
-	Ip      string
-	NetWork string // "tcp", "tcp4", "tcp6", "unix" or "unixpacket"
+	Port               int
+	Ip                 string
+	NetWork            string // "tcp", "tcp4", "tcp6", "unix" or "unixpacket"
+	StopWaitMillSecond int32  // wait for stop connecting wait.
 }
 
 type ServerNode struct {
@@ -144,7 +145,7 @@ func (s *ServerNode) ServerWait() error {
 					if kc == nil {
 						continue
 					}
-					kc.UnderlyingConn.SetDeadline(time.Now().Add(time.Millisecond * 2))
+					kc.UnderlyingConn.SetDeadline(time.Now().Add(time.Millisecond * time.Duration(s.config.StopWaitMillSecond)))
 				}
 			}
 			<-s.done.Done()
@@ -409,6 +410,7 @@ var defaultServerOptions = opts.ServerOptions{
 	WriteBufferSize:       defaultWriteBufSize,
 	ReadBufferSize:        defaultReadBufSize,
 	RecvBufferPool:        util.NewSharedBufferPool(),
+	StopWaitMillSecond:    2,
 }
 
 func NewTcpServer(optParams ...opts.IServerOption) *ServerNode {
@@ -424,9 +426,10 @@ func NewTcpServer(optParams ...opts.IServerOption) *ServerNode {
 		done:  util.NewEvent(),
 		conns: make(map[string]map[*ServerConn]bool),
 		config: ServerConfig{
-			Port:    *port,
-			Ip:      "",
-			NetWork: "tcp",
+			Port:               *port,
+			Ip:                 "",
+			NetWork:            "tcp",
+			StopWaitMillSecond: optsPtr.StopWaitMillSecond,
 		},
 		LogicHandles: make(map[uint16]IBusiLogic),
 	}
